@@ -1,4 +1,5 @@
 const MANIFEST_KEY = "sales/latest-manifest.json";
+const TARGETS_KEY = "targets/latest.json";
 const MAX_CHUNK_BYTES = 10 * 1024 * 1024;
 const MAX_ROWS = 250000;
 const MAX_CHUNKS = 64;
@@ -45,6 +46,8 @@ async function verifyAccess(request) {
 const datePattern = /^\d{4}-\d{2}-\d{2}$/;
 const validRows = rows => Array.isArray(rows) && rows.length > 0 && rows.every(row => datePattern.test(row.d) && typeof row.s === "string" && Number.isFinite(Number(row.u)) && Number.isFinite(Number(row.q)) && Number.isFinite(Number(row.a)));
 const validRanges = ranges => Array.isArray(ranges) && ranges.length > 0 && ranges.every(item => datePattern.test(item.start) && datePattern.test(item.end) && item.start <= item.end);
+const targetMonthPattern = /^\d{4}-\d{2}$/;
+const validTargetRows = rows => Array.isArray(rows) && rows.length > 0 && rows.length <= 10000 && rows.every(row => targetMonthPattern.test(row.d) && typeof row.s === "string" && Number.isFinite(Number(row.u)) && Number.isFinite(Number(row.a)));
 const validUploadId = value => /^[a-zA-Z0-9_-]{8,80}$/.test(value || "");
 const chunkKey = (uploadId, index) => `sales/uploads/${uploadId}/chunk-${String(index).padStart(3, "0")}.json`;
 
@@ -96,13 +99,35 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     if (url.pathname === "/api/health") return json({ok: true, service: "datapulse-shared-sales", storage: "chunked-kv"});
-    if (!["/api/sales", "/api/sales/chunk", "/api/sales/commit"].includes(url.pathname)) return json({ok: false, error: "Not found"}, 404);
+    if (!["/api/sales", "/api/sales/chunk", "/api/sales/commit", "/api/targets"].includes(url.pathname)) return json({ok: false, error: "Not found"}, 404);
 
     const identity = await verifyAccess(request);
     if (!identity) return json({ok: false, error: "Cloudflare Access authentication required"}, 401);
 
     if (url.pathname === "/api/sales" && request.method === "GET") {
       return streamLatest(env, await env.SALES_KV.get(MANIFEST_KEY, "json"));
+    }
+
+    if (url.pathname === "/api/targets" && request.method === "GET") {
+      return json({ok: true, data: await env.SALES_KV.get(TARGETS_KEY, "json")});
+    }
+
+    if (url.pathname === "/api/targets" && request.method === "POST") {
+      try {
+        const payload = await readJson(request, 2 * 1024 * 1024);
+        if (!validTargetRows(payload.rows)) return json({ok: false, error: "目标数据校验失败"}, 400);
+        const data = {
+          version: 1,
+          rows: payload.rows,
+          meta: payload.meta && typeof payload.meta === "object" ? payload.meta : {},
+          updatedAt: new Date().toISOString(),
+          updatedBy: identity.email || identity.sub || "Access user",
+        };
+        await env.SALES_KV.put(TARGETS_KEY, JSON.stringify(data));
+        return json({ok: true, updatedAt: data.updatedAt, rows: data.rows.length});
+      } catch (error) {
+        return json({ok: false, error: error.message === "请求数据过大" ? error.message : "请求不是有效 JSON"}, 400);
+      }
     }
 
     if (url.pathname === "/api/sales/chunk" && request.method === "POST") {
