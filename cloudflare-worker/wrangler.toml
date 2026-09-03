@@ -1,0 +1,11 @@
+name = "datapulse-shared-sales"
+main = "src/index.js"
+compatibility_date = "2026-09-03"
+
+[[kv_namespaces]]
+binding = "SALES_KV"
+id = "8ad9022e1520457ba1d101f5df34055c"
+
+[[routes]]
+pattern = "datapulse.cc.cd/api/*"
+zone_name = "datapulse.cc.cd"
