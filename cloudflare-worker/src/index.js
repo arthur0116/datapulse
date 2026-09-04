@@ -51,6 +51,24 @@ const validTargetRows = rows => Array.isArray(rows) && rows.length > 0 && rows.l
 const validUploadId = value => /^[a-zA-Z0-9_-]{8,80}$/.test(value || "");
 const chunkKey = (uploadId, index) => `sales/uploads/${uploadId}/chunk-${String(index).padStart(3, "0")}.json`;
 
+const manifestLayers = manifest => {
+  if (!manifest) return [];
+  if (Array.isArray(manifest.layers)) return manifest.layers;
+  if (Array.isArray(manifest.chunks)) {
+    return [{
+      updatedAt: manifest.updatedAt,
+      updatedBy: manifest.updatedBy,
+      ranges: manifest.ranges || [],
+      files: manifest.files || [],
+      totalRows: manifest.totalRows || 0,
+      chunks: manifest.chunks,
+    }];
+  }
+  return [];
+};
+
+const rowCoveredByRanges = (row, ranges) => ranges.some(range => row.d >= range.start && row.d <= range.end);
+
 async function readJson(request, maxBytes) {
   const declaredLength = Number(request.headers.get("content-length") || 0);
   if (declaredLength > maxBytes) throw new Error("请求数据过大");
@@ -61,11 +79,12 @@ async function readJson(request, maxBytes) {
 
 async function streamLatest(env, manifest) {
   if (!manifest) return json({ok: true, data: null});
+  const layers = manifestLayers(manifest);
   const publicManifest = {
     version: 1,
     updatedAt: manifest.updatedAt,
     updatedBy: manifest.updatedBy,
-    ranges: manifest.ranges,
+    ranges: layers.flatMap(layer => layer.ranges || []),
     files: manifest.files || [],
     totalRows: manifest.totalRows,
   };
@@ -76,14 +95,19 @@ async function streamLatest(env, manifest) {
         const prefix = `{"ok":true,"data":${JSON.stringify(publicManifest).slice(0, -1)},"rows":[`;
         controller.enqueue(encoder.encode(prefix));
         let hasRows = false;
-        for (const key of manifest.chunks) {
-          const text = await env.SALES_KV.get(key);
-          if (!text || text[0] !== "[" || text.at(-1) !== "]") throw new Error("共享数据分片缺失");
-          const inner = text.slice(1, -1);
-          if (!inner) continue;
-          if (hasRows) controller.enqueue(encoder.encode(","));
-          controller.enqueue(encoder.encode(inner));
-          hasRows = true;
+        for (let layerIndex = 0; layerIndex < layers.length; layerIndex++) {
+          const layer = layers[layerIndex];
+          const newerRanges = layers.slice(layerIndex + 1).flatMap(item => item.ranges || []);
+          for (const key of layer.chunks || []) {
+            const rows = await env.SALES_KV.get(key, "json");
+            if (!Array.isArray(rows)) throw new Error("共享数据分片缺失");
+            const visibleRows = newerRanges.length ? rows.filter(row => !rowCoveredByRanges(row, newerRanges)) : rows;
+            if (!visibleRows.length) continue;
+            const inner = JSON.stringify(visibleRows).slice(1, -1);
+            if (hasRows) controller.enqueue(encoder.encode(","));
+            controller.enqueue(encoder.encode(inner));
+            hasRows = true;
+          }
         }
         controller.enqueue(encoder.encode("]}}"));
         controller.close();
@@ -154,9 +178,20 @@ export default {
         const chunks = Array.from({length: totalChunks}, (_, index) => chunkKey(uploadId, index));
         const checks = await Promise.all(chunks.map(key => env.SALES_KV.get(key, {type: "text", cacheTtl: 60})));
         if (checks.some(value => !value)) return json({ok: false, error: "销售数据分片尚未完整上传"}, 409);
-        const manifest = {version: 1, updatedAt: new Date().toISOString(), updatedBy: identity.email || identity.sub || "Access user", ranges, files: Array.isArray(files) ? files.slice(0, 200) : [], totalRows, chunks};
+        const previous = await env.SALES_KV.get(MANIFEST_KEY, "json");
+        const layers = manifestLayers(previous);
+        if (layers.length >= 64) return json({ok: false, error: "增量版本过多，请联系管理员执行数据整理"}, 409);
+        const layer = {updatedAt: new Date().toISOString(), updatedBy: identity.email || identity.sub || "Access user", ranges, files: Array.isArray(files) ? files.slice(0, 20) : [], totalRows, chunks};
+        const manifest = {
+          version: 2,
+          updatedAt: layer.updatedAt,
+          updatedBy: layer.updatedBy,
+          files: [...new Set([...layers.flatMap(item => item.files || []), ...layer.files])].slice(-200),
+          totalRows: (previous?.totalRows || 0) + totalRows,
+          layers: [...layers, layer],
+        };
         await env.SALES_KV.put(MANIFEST_KEY, JSON.stringify(manifest));
-        return json({ok: true, updatedAt: manifest.updatedAt, rows: totalRows, ranges: ranges.length});
+        return json({ok: true, updatedAt: manifest.updatedAt, rows: totalRows, ranges: ranges.length, mode: "incremental"});
       } catch (error) {
         return json({ok: false, error: error.message === "请求数据过大" ? error.message : "请求不是有效 JSON"}, 400);
       }
