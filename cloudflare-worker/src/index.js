@@ -1,5 +1,6 @@
 const MANIFEST_KEY = "sales/latest-manifest.json";
 const TARGETS_KEY = "targets/latest.json";
+const DICTIONARY_KEY = "dictionary/latest.json";
 const MAX_CHUNK_BYTES = 10 * 1024 * 1024;
 const MAX_ROWS = 250000;
 const MAX_CHUNKS = 64;
@@ -48,6 +49,8 @@ const validRows = rows => Array.isArray(rows) && rows.length > 0 && rows.every(r
 const validRanges = ranges => Array.isArray(ranges) && ranges.length > 0 && ranges.every(item => datePattern.test(item.start) && datePattern.test(item.end) && item.start <= item.end);
 const targetMonthPattern = /^\d{4}-\d{2}$/;
 const validTargetRows = rows => Array.isArray(rows) && rows.length > 0 && rows.length <= 10000 && rows.every(row => targetMonthPattern.test(row.d) && typeof row.s === "string" && Number.isFinite(Number(row.u)) && Number.isFinite(Number(row.a)));
+const validTargetMonths = months => Array.isArray(months) && months.length > 0 && months.length <= 24 && months.every(month => targetMonthPattern.test(month));
+const validDictionaryRows = rows => Array.isArray(rows) && rows.length > 0 && rows.length <= 10000 && rows.every(row => typeof row.c === "string" && typeof row.newSku === "string" && typeof row.oldSku === "string" && (row.newSku || row.oldSku));
 const validUploadId = value => /^[a-zA-Z0-9_-]{8,80}$/.test(value || "");
 const chunkKey = (uploadId, index) => `sales/uploads/${uploadId}/chunk-${String(index).padStart(3, "0")}.json`;
 
@@ -123,7 +126,7 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     if (url.pathname === "/api/health") return json({ok: true, service: "datapulse-shared-sales", storage: "chunked-kv"});
-    if (!["/api/sales", "/api/sales/chunk", "/api/sales/commit", "/api/targets"].includes(url.pathname)) return json({ok: false, error: "Not found"}, 404);
+    if (!["/api/sales", "/api/sales/chunk", "/api/sales/commit", "/api/targets", "/api/dictionary"].includes(url.pathname)) return json({ok: false, error: "Not found"}, 404);
 
     const identity = await verifyAccess(request);
     if (!identity) return json({ok: false, error: "Cloudflare Access authentication required"}, 401);
@@ -136,19 +139,57 @@ export default {
       return json({ok: true, data: await env.SALES_KV.get(TARGETS_KEY, "json")});
     }
 
+    if (url.pathname === "/api/dictionary" && request.method === "GET") {
+      return json({ok: true, data: await env.SALES_KV.get(DICTIONARY_KEY, "json")});
+    }
+
+    if (url.pathname === "/api/dictionary" && request.method === "POST") {
+      try {
+        const payload = await readJson(request, 2 * 1024 * 1024);
+        if (!validDictionaryRows(payload.rows)) return json({ok: false, error: "基础字段字典校验失败"}, 400);
+        const data = {
+          version: 1,
+          rows: payload.rows,
+          file: String(payload.file || "").slice(0, 240),
+          updatedAt: new Date().toISOString(),
+          updatedBy: identity.email || identity.sub || "Access user",
+        };
+        await env.SALES_KV.put(DICTIONARY_KEY, JSON.stringify(data));
+        return json({ok: true, updatedAt: data.updatedAt, rows: data.rows.length, file: data.file});
+      } catch (error) {
+        return json({ok: false, error: error.message === "请求数据过大" ? error.message : "请求不是有效 JSON"}, 400);
+      }
+    }
+
     if (url.pathname === "/api/targets" && request.method === "POST") {
       try {
         const payload = await readJson(request, 2 * 1024 * 1024);
         if (!validTargetRows(payload.rows)) return json({ok: false, error: "目标数据校验失败"}, 400);
+        const months = payload.months || [...new Set(payload.rows.map(row => row.d))];
+        if (!validTargetMonths(months) || payload.rows.some(row => !months.includes(row.d))) {
+          return json({ok: false, error: "目标月份校验失败"}, 400);
+        }
+        const previous = await env.SALES_KV.get(TARGETS_KEY, "json");
+        const keptRows = Array.isArray(previous?.rows) ? previous.rows.filter(row => !months.includes(row.d)) : [];
+        const previousSheets = Array.isArray(previous?.meta?.targetSheets) ? previous.meta.targetSheets : [];
+        const incomingSheets = Array.isArray(payload.meta?.targetSheets) ? payload.meta.targetSheets : [];
+        const targetSheets = previousSheets.filter(item => !(item.months || []).some(month => months.includes(month))).concat(incomingSheets);
+        const rows = keptRows.concat(payload.rows).sort((a, b) => a.d.localeCompare(b.d) || a.o.localeCompare(b.o, "zh-CN") || a.c.localeCompare(b.c, "zh-CN") || a.m.localeCompare(b.m, "zh-CN"));
         const data = {
-          version: 1,
-          rows: payload.rows,
-          meta: payload.meta && typeof payload.meta === "object" ? payload.meta : {},
+          version: 2,
+          rows,
+          meta: {
+            ...(previous?.meta || {}),
+            ...(payload.meta && typeof payload.meta === "object" ? payload.meta : {}),
+            targetSheets,
+            targetRows: rows.length,
+            targetMappedRows: rows.filter(row => row.b !== "未映射").length,
+          },
           updatedAt: new Date().toISOString(),
           updatedBy: identity.email || identity.sub || "Access user",
         };
         await env.SALES_KV.put(TARGETS_KEY, JSON.stringify(data));
-        return json({ok: true, updatedAt: data.updatedAt, rows: data.rows.length});
+        return json({ok: true, updatedAt: data.updatedAt, rows: data.rows.length, uploadedRows: payload.rows.length, months});
       } catch (error) {
         return json({ok: false, error: error.message === "请求数据过大" ? error.message : "请求不是有效 JSON"}, 400);
       }
